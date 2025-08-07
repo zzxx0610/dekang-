@@ -3,6 +3,7 @@ import pandas as pd
 import os
 import io
 import zipfile
+import time
 
 # --- 页面基础设置 ---
 st.set_page_config(
@@ -11,56 +12,84 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 主函数，包含之前脚本的核心逻辑 ---
-def process_and_zip(uploaded_file, column_name):
+# --- 主函数，现在接收一个streamlit占位符来显示日志 ---
+def process_and_zip(uploaded_file, column_name, log_container):
     """
     处理上传的Excel文件，将其拆分，并将结果打包成一个ZIP文件。
-    返回一个包含ZIP文件的内存中对象(BytesIO)。
+    同时，将处理日志实时更新到指定的Streamlit容器中。
     """
+    logs = []  # 用来收集日志信息
+
+    def log_message(message):
+        """辅助函数，用于记录日志并更新界面"""
+        logs.append(message)
+        # 使用Markdown的代码块格式来显示日志
+        log_container.markdown("```\n" + "\n".join(logs) + "\n```")
+
     try:
+        # 获取源文件名（不含扩展名），用于日志和输出文件名
+        source_filename = os.path.splitext(uploaded_file.name)[0]
+        
+        log_message(f"准备处理文件: {uploaded_file.name}")
         df = pd.read_excel(uploaded_file)
         
-        # 使用 st.info 在界面上显示反馈信息
-        st.info(f"成功读取文件，共包含 {len(df)} 条数据。")
+        total_rows = len(df)
+        log_message(f"✅ 成功读取源文件，共包含 {total_rows} 条数据。")
 
         unique_values = df[column_name].dropna().unique()
-        st.info(f"在“{column_name}”列中发现 {len(unique_values)} 个独立的项目，准备开始拆分...")
+        log_message(f"🔍 在“{column_name}”列中发现 {len(unique_values)} 个独立的收货单位，准备开始拆分...")
+        log_message("-" * 40) # 分割线
 
         # 创建一个在内存中的ZIP文件
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
             original_columns = df.columns.tolist()
             
-            # 使用 st.progress 显示处理进度
-            progress_bar = st.progress(0)
+            processed_rows_count = 0
             
             for i, value in enumerate(unique_values, 1):
                 df_group = df[df[column_name] == value]
+                num_rows_in_group = len(df_group)
+                processed_rows_count += num_rows_in_group
                 
                 # 清理文件名
                 safe_filename = "".join([c for c in str(value) if c.isalnum() or c in (' ', '_', '-')]).rstrip()
                 if not safe_filename:
                     safe_filename = f"未命名项目_{i}"
                 
+                output_filename_in_zip = f"{safe_filename}.xlsx"
+                
                 # 将拆分出的Excel文件写入内存
                 excel_buffer = io.BytesIO()
                 df_group.reindex(columns=original_columns).to_excel(excel_buffer, index=False, engine='openpyxl')
-                excel_buffer.seek(0) # 重置指针到开头
+                excel_buffer.seek(0)
                 
                 # 将内存中的Excel文件添加到ZIP包中
-                zf.writestr(f"{safe_filename}.xlsx", excel_buffer.read())
+                zf.writestr(output_filename_in_zip, excel_buffer.read())
                 
-                # 更新进度条
-                progress_bar.progress(i / len(unique_values))
+                # 记录这条处理日志
+                log_message(f"({i}/{len(unique_values)}) 已生成文件: {output_filename_in_zip} (包含 {num_rows_in_group} 条数据)")
+                time.sleep(0.01) # 短暂休眠，让前端有时间渲染，看起来更流畅
 
+        log_message("-" * 40)
+        log_message("✅ 所有表格拆分完成！")
+
+        # 最终核对
+        if total_rows == processed_rows_count:
+            log_message(f"数据核对成功：原始 {total_rows} 条，已处理 {processed_rows_count} 条。")
+        else:
+            unprocessed_rows = total_rows - processed_rows_count
+            log_message(f"⚠️ 警告：数据核对不匹配！有 {unprocessed_rows} 条数据未被处理。")
+            log_message(f"   (原因通常是 '{column_name}' 列中存在空白单元格)")
+        
         # 将ZIP文件的指针也重置到开头
         zip_buffer.seek(0)
-        return zip_buffer
+        return zip_buffer, source_filename
 
     except Exception as e:
-        st.error(f"处理过程中发生错误: {e}")
-        st.error("请检查上传的文件格式是否正确，以及指定的列名是否存在于文件中。")
-        return None
+        log_message(f"❌ 处理过程中发生错误: {e}")
+        log_message("   请检查上传的文件格式是否正确，以及指定的列名是否存在于文件中。")
+        return None, None
 
 
 # --- Streamlit 界面布局 ---
@@ -73,32 +102,33 @@ st.markdown("---")
 uploaded_file = st.file_uploader("上传您的 Excel 总表", type=['xlsx'])
 
 if uploaded_file is not None:
-    # 让用户可以自定义列名
-    st.subheader("设置拆分规则")
+    st.subheader("1. 设置拆分规则")
     
-    # 尝试从文件中读取列名，提供给用户选择
     try:
-        temp_df = pd.read_excel(uploaded_file, nrows=0) # 只读表头，速度快
+        temp_df = pd.read_excel(uploaded_file, nrows=0)
         column_options = temp_df.columns.tolist()
-        # 让用户选择列，默认推荐'收货单位名称'（如果存在的话）
         default_index = column_options.index('收货单位名称') if '收货单位名称' in column_options else 0
         column_to_split = st.selectbox("请选择用于分类的列名:", options=column_options, index=default_index)
     except Exception:
-        # 如果读取失败，退回到手动输入
         column_to_split = st.text_input("无法自动读取列名，请输入用于分类的列名:", value="收货单位名称")
 
-    # 2. “开始处理”按钮
+    st.subheader("2. 开始处理并查看日志")
+    
+    # 创建一个用于显示日志的占位符
+    log_container = st.empty()
+    log_container.info("准备就绪，点击下方按钮开始处理。")
+
     if st.button("🚀 开始拆分", use_container_width=True):
-        with st.spinner('正在处理中，请稍候...'):
-            zip_buffer = process_and_zip(uploaded_file, column_to_split)
+        # 在点击按钮后，清空占位符，准备显示新日志
+        log_container.empty()
         
-        if zip_buffer:
+        with st.spinner('正在处理中，请耐心等待...'):
+            zip_buffer, source_filename = process_and_zip(uploaded_file, column_to_split, log_container)
+        
+        if zip_buffer and source_filename:
             st.success("🎉 处理完成！可以下载结果了。")
             
-            # 提取原始文件名用于命名ZIP包
-            source_filename = os.path.splitext(uploaded_file.name)[0]
-            
-            # 3. 下载按钮
+            st.subheader("3. 下载结果")
             st.download_button(
                 label="📥 下载拆分结果 (ZIP)",
                 data=zip_buffer,
